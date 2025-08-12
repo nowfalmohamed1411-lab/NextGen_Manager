@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-NextGen Manager - Telegram Group Scheduler Bot (group-only notifications)
+NextGen Manager - Telegram Group Scheduler Bot (Replit + UptimeRobot keepalive)
 
-Behaviour:
-- Operates for a single registered team group (run /setteam inside your group).
-- All alerts, confirmations, overlaps, and reminders are posted ONLY in the registered group.
-- Users add slots in the group with /addslot. If overlaps exist, the bot posts a Confirm/Cancel prompt in the group
-  and only the slot creator can Confirm or Cancel.
-- Reminders (15 minutes before) are posted to the group only.
-- Users can view /me and /team in the group and cancel their own slots with /cancel <id>.
+This version runs the Telegram bot (polling) and starts a small aiohttp webserver
+so UptimeRobot can ping the root URL to keep the Repl alive.
 
-IMPORTANT:
-- The bot must be added to the group and the group must register itself using /setteam.
-- Make sure BotFather privacy is set to allow the bot to receive commands (recommended: /setprivacy -> Disable).
+Environment variables required:
+- TELEGRAM_TOKEN
+- SPREADSHEET_ID
+- GOOGLE_SERVICE_ACCOUNT_JSON  (paste full JSON text)
+- TZ (optional, e.g., "Asia/Kolkata")
 """
 
 import os
@@ -21,8 +18,14 @@ import logging
 import re
 import uuid
 from datetime import datetime, date, timedelta
-from zoneinfo import ZoneInfo
 
+# timezone handling
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+from aiohttp import web
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -40,10 +43,17 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Display name used in messages (set the Bot name in BotFather to "NextGen Manager")
 BOT_DISPLAY_NAME = "NextGen Manager"
 
-TZ = ZoneInfo("Asia/Kolkata")  # change if needed
+TZ_NAME = os.environ.get("TZ", "Asia/Kolkata")
+if ZoneInfo:
+    try:
+        TZ = ZoneInfo(TZ_NAME)
+    except Exception:
+        TZ = None
+else:
+    TZ = None
+
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
@@ -71,21 +81,21 @@ def init_sheets():
     # slots (confirmed) sheet
     try:
         SLOTS_SHEET = SPREADSHEET.worksheet("slots")
-    except gspread.exceptions.WorksheetNotFound:
+    except Exception:
         SLOTS_SHEET = SPREADSHEET.add_worksheet(title="slots", rows="2000", cols="20")
         SLOTS_SHEET.append_row(["id","date","start_time","end_time","username","first_name","user_id","details","created_at","reminder_sent"])
 
     # pending sheet (for tentative slots awaiting confirmation)
     try:
         PENDING_SHEET = SPREADSHEET.worksheet("pending")
-    except gspread.exceptions.WorksheetNotFound:
+    except Exception:
         PENDING_SHEET = SPREADSHEET.add_worksheet(title="pending", rows="500", cols="20")
         PENDING_SHEET.append_row(["id","date","start_time","end_time","username","first_name","user_id","details","created_at"])
 
     # meta sheet (store team_chat_id etc.)
     try:
         META_SHEET = SPREADSHEET.worksheet("meta")
-    except gspread.exceptions.WorksheetNotFound:
+    except Exception:
         META_SHEET = SPREADSHEET.add_worksheet(title="meta", rows="50", cols="2")
         META_SHEET.append_row(["key","value"])
 
@@ -166,7 +176,10 @@ def delete_slot(slot_id):
 def make_dt(date_str, time_str):
     d = date.fromisoformat(date_str)
     hhmm = datetime.strptime(time_str, "%H:%M").time()
-    return datetime.combine(d, hhmm).replace(tzinfo=TZ)
+    if TZ:
+        return datetime.combine(d, hhmm).replace(tzinfo=TZ)
+    else:
+        return datetime.combine(d, hhmm)
 
 def overlaps(a_start, a_end, b_start, b_end):
     return (a_start < b_end) and (b_start < a_end)
@@ -175,15 +188,14 @@ def overlaps(a_start, a_end, b_start, b_end):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         f"Hi — I am *{BOT_DISPLAY_NAME}*.\n\n"
-        "This bot is group-first. You must add the bot to your team group and run /setteam in the group.\n\n"
+        "This bot is group-first. Add me to your team group and run /setteam in the group.\n\n"
         "Commands (use inside the registered group):\n"
         "/addslot YYYY-MM-DD HH:MM HH:MM Details...  OR  /addslot HH:MM-HH:MM Details... (date defaults to today)\n"
         "/me [YYYY-MM-DD]   — show your slots for the date (posted in group)\n"
         "/team [YYYY-MM-DD] — show team slots for the date (posted in group)\n"
         "/cancel <id>       — cancel the slot you created\n"
         "/setteam           — (run once inside the group) register this group for all alerts\n\n"
-        "Behaviour:\n- Overlap prompts and reminders are posted ONLY in the registered group.\n- Only the slot creator can Confirm/Cancel a pending (overlapping) slot.\n- Reminders: 15 minutes before the start, posted to the group.\n\n"
-        "Important setup notes:\n- Add the bot to the group & give it permission to send messages.\n- (Recommended) Ask BotFather to disable privacy for the bot so it can see commands in the group: /setprivacy -> disable.\n"
+        "Behaviour:\n- Overlap prompts and reminders are posted ONLY in the registered group.\n- Only the slot creator can Confirm/Cancel a pending (overlapping) slot.\n- Reminders: 15 minutes before the start, posted to the group.\n"
     )
     await update.message.reply_text(txt, parse_mode='Markdown')
 
@@ -213,80 +225,80 @@ async def addslot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # parse
     date_str, start_str, end_str, details = None, None, None, ""
-    if len(args) >= 3 and re.match(r\"^\\d{4}-\\d{2}-\\d{2}$\", args[0]):
+    if len(args) >= 3 and re.match(r"^\d{4}-\d{2}-\d{2}$", args[0]):
         date_str = args[0]
         start_str = args[1]
         end_str = args[2]
-        details = \" \".join(args[3:]) or \"Busy\"
-    elif re.match(r\"^\\d{1,2}:\\d{2}-\\d{1,2}:\\d{2}$\", args[0]):
+        details = " ".join(args[3:]) or "Busy"
+    elif re.match(r"^\d{1,2}:\d{2}-\d{1,2}:\d{2}$", args[0]):
         date_str = date.today().isoformat()
-        start_str, end_str = args[0].split(\"-\")
-        details = \" \".join(args[1:]) or \"Busy\"
-    elif len(args) >= 2 and re.match(r\"^\\d{1,2}:\\d{2}$\", args[0]) and re.match(r\"^\\d{1,2}:\\d{2}$\", args[1]):
+        start_str, end_str = args[0].split("-")
+        details = " ".join(args[1:]) or "Busy"
+    elif len(args) >= 2 and re.match(r"^\d{1,2}:\d{2}$", args[0]) and re.match(r"^\d{1,2}:\d{2}$", args[1]):
         date_str = date.today().isoformat()
         start_str = args[0]
         end_str = args[1]
-        details = \" \".join(args[2:]) or \"Busy\"
+        details = " ".join(args[2:]) or "Busy"
     else:
-        await update.message.reply_text(\"Couldn't parse. Use /addslot YYYY-MM-DD HH:MM HH:MM Details... or /addslot HH:MM-HH:MM Details...\")
+        await update.message.reply_text("Couldn't parse. Use /addslot YYYY-MM-DD HH:MM HH:MM Details... or /addslot HH:MM-HH:MM Details...")
         return
 
     try:
-        datetime.strptime(start_str, \"%H:%M\")
-        datetime.strptime(end_str, \"%H:%M\")
+        datetime.strptime(start_str, "%H:%M")
+        datetime.strptime(end_str, "%H:%M")
     except Exception:
-        await update.message.reply_text(\"Times must be HH:MM (24-hour).\")
+        await update.message.reply_text("Times must be HH:MM (24-hour).")
         return
 
     try:
         start_dt = make_dt(date_str, start_str)
         end_dt = make_dt(date_str, end_str)
     except Exception:
-        await update.message.reply_text(\"Invalid date/time format.\")
+        await update.message.reply_text("Invalid date/time format.")
         return
 
     if not (start_dt < end_dt):
-        await update.message.reply_text(\"Start must be before end.\")
+        await update.message.reply_text("Start must be before end.")
         return
 
     user = update.effective_user
     slot_id = uuid.uuid4().hex[:10]
-    created_at = datetime.now(TZ).isoformat()
+    created_at = datetime.now(TZ).isoformat() if TZ else datetime.now().isoformat()
 
     # check overlaps with confirmed slots for that date
     overlaps_found = []
     for rec in all_slots_records():
-        if rec.get(\"date\") != date_str:
+        if rec.get("date") != date_str:
             continue
         try:
-            other_start = make_dt(rec[\"date\"], rec[\"start_time\"])
-            other_end = make_dt(rec[\"date\"], rec[\"end_time\"])
+            other_start = make_dt(rec["date"], rec["start_time"])
+            other_end = make_dt(rec["date"], rec["end_time"])
         except Exception:
             continue
         if overlaps(start_dt, end_dt, other_start, other_end):
             overlaps_found.append(rec)
 
     if not overlaps_found:
-        row = [slot_id, date_str, start_str, end_str, user.username or \"\", user.first_name or \"\", str(user.id), details, created_at, \"\"]
+        row = [slot_id, date_str, start_str, end_str, user.username or "", user.first_name or "", str(user.id), details, created_at, ""]
         append_slot_row(row)
         # Post to the registered group only
-        await context.bot.send_message(chat_id=int(team_chat), text=f\"✅ Slot added by {user.first_name or user.username}: {date_str} {start_str}-{end_str} — {details} (ID {slot_id})\")
+        await context.bot.send_message(chat_id=int(team_chat), text=f"✅ Slot added by {user.first_name or user.username}: {date_str} {start_str}-{end_str} — {details} (ID {slot_id})")
         return
 
     # overlaps -> create pending and post confirm buttons in group
-    pending_row = [slot_id, date_str, start_str, end_str, user.username or \"\", user.first_name or \"\", str(user.id), details, created_at]
+    pending_row = [slot_id, date_str, start_str, end_str, user.username or "", user.first_name or "", str(user.id), details, created_at]
     append_pending_row(pending_row)
 
-    text = f\"⚠️ {user.first_name or user.username} wants to add a slot that overlaps {len(overlaps_found)} existing slot(s):\\n\"
+    text = f"⚠️ {user.first_name or user.username} wants to add a slot that overlaps {len(overlaps_found)} existing slot(s):\n"
     for o in overlaps_found:
-        text += f\"- {o.get('first_name') or o.get('username')}: {o['start_time']}-{o['end_time']} — {o['details']}\\n\"
-    text += \"\\nCreator, please confirm or cancel.\" 
+        text += f"- {o.get('first_name') or o.get('username')}: {o['start_time']}-{o['end_time']} — {o['details']}\n"
+    text += "\nCreator, please confirm or cancel."
 
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(\"✅ Confirm (creator only)\", callback_data=f\"confirm:{slot_id}\"),
-                InlineKeyboardButton(\"❌ Cancel\", callback_data=f\"cancel:{slot_id}\"),
+                InlineKeyboardButton("✅ Confirm (creator only)", callback_data=f"confirm:{slot_id}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"cancel:{slot_id}"),
             ]
         ]
     )
@@ -296,33 +308,33 @@ async def addslot(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data or \"\"
+    data = query.data or ""
     user = query.from_user
-    team_chat = get_meta_value(\"team_chat_id\")
+    team_chat = get_meta_value("team_chat_id")
 
-    if data.startswith(\"confirm:\"):
-        slot_id = data.split(\":\",1)[1]
+    if data.startswith("confirm:"):
+        slot_id = data.split(":",1)[1]
         pending = get_pending_record(slot_id)
         if not pending:
-            await query.edit_message_text(\"This pending slot was not found or already processed.\")
+            await query.edit_message_text("This pending slot was not found or already processed.")
             return
         # only creator can confirm
-        if str(user.id) != str(pending.get(\"user_id\")):
-            await query.edit_message_text(\"Only the slot creator can confirm or cancel this pending slot.\")
+        if str(user.id) != str(pending.get("user_id")):
+            await query.edit_message_text("Only the slot creator can confirm or cancel this pending slot.")
             return
 
         # move pending -> slots
         row = [
-            pending.get(\"id\"),
-            pending.get(\"date\"),
-            pending.get(\"start_time\"),
-            pending.get(\"end_time\"),
-            pending.get(\"username\"),
-            pending.get(\"first_name\"),
-            pending.get(\"user_id\"),
-            pending.get(\"details\"),
-            pending.get(\"created_at\"),
-            \"\"
+            pending.get("id"),
+            pending.get("date"),
+            pending.get("start_time"),
+            pending.get("end_time"),
+            pending.get("username"),
+            pending.get("first_name"),
+            pending.get("user_id"),
+            pending.get("details"),
+            pending.get("created_at"),
+            ""
         ]
         append_slot_row(row)
         delete_pending(slot_id)
@@ -343,81 +355,81 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 overlaps_list.append(rec)
 
         # post confirmation and overlaps to the group only
-        reply_text = f\"✅ Slot confirmed by {pending.get('first_name') or pending.get('username')}: {pending.get('date')} {pending.get('start_time')}-{pending.get('end_time')} — {pending.get('details')} (ID {pending.get('id')})\\n\\nOverlaps with:\n\"
+        reply_text = f"✅ Slot confirmed by {pending.get('first_name') or pending.get('username')}: {pending.get('date')} {pending.get('start_time')}-{pending.get('end_time')} — {pending.get('details')} (ID {pending.get('id')})\\n\\nOverlaps with:\\n"
         if overlaps_list:
             for o in overlaps_list:
-                reply_text += f\"- {o.get('first_name') or o.get('username')}: {o.get('start_time')}-{o.get('end_time')} — {o.get('details')}\\n\"
+                reply_text += f"- {o.get('first_name') or o.get('username')}: {o.get('start_time')}-{o.get('end_time')} — {o.get('details')}\\n"
         else:
-            reply_text += \"- None\\n\"
+            reply_text += "- None\\n"
 
         if team_chat:
             await context.bot.send_message(chat_id=int(team_chat), text=reply_text)
-        await query.edit_message_text(\"Slot confirmed and posted to group.\")
+        await query.edit_message_text("Slot confirmed and posted to group.")
         return
 
-    if data.startswith(\"cancel:\"):
-        slot_id = data.split(\":\",1)[1]
+    if data.startswith("cancel:"):
+        slot_id = data.split(":",1)[1]
         pending = get_pending_record(slot_id)
         if not pending:
-            await query.edit_message_text(\"This pending slot was not found or already processed.\")
+            await query.edit_message_text("This pending slot was not found or already processed.")
             return
-        if str(user.id) != str(pending.get(\"user_id\")):
-            await query.edit_message_text(\"Only the slot creator can confirm or cancel this pending slot.\")
+        if str(user.id) != str(pending.get("user_id")):
+            await query.edit_message_text("Only the slot creator can confirm or cancel this pending slot.")
             return
         delete_pending(slot_id)
-        await query.edit_message_text(\"Cancelled: the pending slot was not added.\")
+        await query.edit_message_text("Cancelled: the pending slot was not added.")
         return
 
 async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    team_chat = get_meta_value(\"team_chat_id\")
+    team_chat = get_meta_value("team_chat_id")
     if not team_chat:
-        await update.message.reply_text(\"No team group registered yet. Run /setteam in your group.\")
+        await update.message.reply_text("No team group registered yet. Run /setteam in your group.")
         return
 
     # Enforce being in group
     if str(update.effective_chat.id) != str(team_chat):
-        await update.message.reply_text(\"Run /me inside the registered group.\")
+        await update.message.reply_text("Run /me inside the registered group.")
         return
 
     args = context.args
     target_date = date.today().isoformat()
-    if args and re.match(r\"^\\d{4}-\\d{2}-\\d{2}$\", args[0]):
+    if args and re.match(r"^\\d{4}-\\d{2}-\\d{2}$", args[0]):
         target_date = args[0]
     records = all_slots_records()
     user_id = str(update.effective_user.id)
-    my_slots = [r for r in records if r.get(\"user_id\") == user_id and r.get(\"date\") == target_date]
+    my_slots = [r for r in records if r.get("user_id") == user_id and r.get("date") == target_date]
     if not my_slots:
-        await update.message.reply_text(f\"No slots for {target_date}.\")
+        await update.message.reply_text(f"No slots for {target_date}.")
         return
-    text = f\"Your slots for {target_date}:\\n\"
+    text = f"Your slots for {target_date}:\\n"
     for r in my_slots:
-        text += f\"- ID {r['id']}: {r['start_time']}-{r['end_time']} — {r['details']}\\n\"
+        text += f"- ID {r['id']}: {r['start_time']}-{r['end_time']} — {r['details']}\\n"
     await update.message.reply_text(text)
 
 async def team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    team_chat = get_meta_value(\"team_chat_id\")
+    team_chat = get_meta_value("team_chat_id")
     if not team_chat:
-        await update.message.reply_text(\"No team group registered yet. Run /setteam in your group.\")
+        await update.message.reply_text("No team group registered yet. Run /setteam in your group.")
         return
     if str(update.effective_chat.id) != str(team_chat):
-        await update.message.reply_text(\"Run /team inside the registered group.\")
+        await update.message.reply_text("Run /team inside the registered group.")
         return
 
     args = context.args
     target_date = date.today().isoformat()
-    if args and re.match(r\"^\\d{4}-\\d{2}-\\d{2}$\", args[0]):
+    if args and re.match(r"^\\d{4}-\\d{2}-\\d{2}$", args[0]):
         target_date = args[0]
     records = all_slots_records()
-    day_slots = [r for r in records if r.get(\"date\") == target_date]
+    day_slots = [r for r in records if r.get("date") == target_date]
     if not day_slots:
-        await update.message.reply_text(f\"No slots for {target_date}.\")
+        await update.message.reply_text(f"No slots for {target_date}.")
         return
-    text = f\"Team slots for {target_date}:\\n\"
+    text = f"Team slots for {target_date}:\\n"
     for r in day_slots:
-        text += f\"- {r.get('first_name') or r.get('username')}: {r['start_time']}-{r['end_time']} — {r['details']} (ID {r['id']})\\n\"
+        text += f"- {r.get('first_name') or r.get('username')}: {r['start_time']}-{r['end_time']} — {r['details']} (ID {r['id']})\\n"
 
     # detect overlaps
-    overlaps_text = \"\"
+    overlaps_text = ""
     for i in range(len(day_slots)):
         a = day_slots[i]
         a_start = make_dt(a['date'], a['start_time'])
@@ -427,88 +439,105 @@ async def team_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             b_start = make_dt(b['date'], b['start_time'])
             b_end = make_dt(b['date'], b['end_time'])
             if overlaps(a_start, a_end, b_start, b_end):
-                overlaps_text += f\"- {a.get('first_name') or a.get('username')} ({a['start_time']}-{a['end_time']}) overlaps with {b.get('first_name') or b.get('username')} ({b['start_time']}-{b['end_time']})\\n\"
+                overlaps_text += f"- {a.get('first_name') or a.get('username')} ({a['start_time']}-{a['end_time']}) overlaps with {b.get('first_name') or b.get('username')} ({b['start_time']}-{b['end_time']})\\n"
 
     if overlaps_text:
-        text += \"\\n⚠️ Overlaps:\\n\" + overlaps_text
+        text += "\\n⚠️ Overlaps:\\n" + overlaps_text
     await update.message.reply_text(text)
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    team_chat = get_meta_value(\"team_chat_id\")
+    team_chat = get_meta_value("team_chat_id")
     if not team_chat:
-        await update.message.reply_text(\"No team group registered yet. Run /setteam in your group.\")
+        await update.message.reply_text("No team group registered yet. Run /setteam in your group.")
         return
     if str(update.effective_chat.id) != str(team_chat):
-        await update.message.reply_text(\"Run /cancel inside the registered group.\")
+        await update.message.reply_text("Run /cancel inside the registered group.")
         return
 
     args = context.args
     if not args:
-        await update.message.reply_text(\"Usage: /cancel <slot_id>\")
+        await update.message.reply_text("Usage: /cancel <slot_id>")
         return
     slot_id = args[0]
     row = find_slot_row(slot_id)
     if row:
         owner_user_id = SLOTS_SHEET.cell(row, 7).value  # user_id column
         if str(owner_user_id) != str(update.effective_user.id):
-            await update.message.reply_text(\"You can only cancel slots you created.\")
+            await update.message.reply_text("You can only cancel slots you created.")
             return
         SLOTS_SHEET.delete_rows(row)
-        await context.bot.send_message(chat_id=int(team_chat), text=f\"🗑️ Slot {slot_id} removed by {update.effective_user.first_name or update.effective_user.username}.\")
+        await context.bot.send_message(chat_id=int(team_chat), text=f"🗑️ Slot {slot_id} removed by {update.effective_user.first_name or update.effective_user.username}.")
         return
     prow = find_pending_row(slot_id)
     if prow:
         owner_user_id = PENDING_SHEET.cell(prow, 7).value
         if str(owner_user_id) != str(update.effective_user.id):
-            await update.message.reply_text(\"You can only cancel pending slots you created.\")
+            await update.message.reply_text("You can only cancel pending slots you created.")
             return
         PENDING_SHEET.delete_rows(prow)
-        await context.bot.send_message(chat_id=int(team_chat), text=f\"Cancelled pending slot {slot_id} by {update.effective_user.first_name or update.effective_user.username}.\")
+        await context.bot.send_message(chat_id=int(team_chat), text=f"Cancelled pending slot {slot_id} by {update.effective_user.first_name or update.effective_user.username}.")
         return
-    await update.message.reply_text(\"Slot ID not found.\")
+    await update.message.reply_text("Slot ID not found.")
 
 # ----- Reminder job -----
 async def check_reminders(application):
-    team_chat = get_meta_value(\"team_chat_id\")
+    team_chat = get_meta_value("team_chat_id")
     if not team_chat:
         return
-    now = datetime.now(TZ)
+    now = datetime.now(TZ) if TZ else datetime.now()
     window_end = now + timedelta(minutes=15)
     for rec in all_slots_records():
-        if str(rec.get(\"reminder_sent\")).strip().lower() == \"yes\":
+        if str(rec.get("reminder_sent")).strip().lower() == "yes":
             continue
         try:
             start_dt = make_dt(rec['date'], rec['start_time'])
         except Exception:
             continue
         if now < start_dt <= window_end:
-            text = f\"🔔 Reminder: {rec.get('first_name') or rec.get('username')}'s \\\"{rec.get('details')}\\\" starts at {rec.get('start_time')} (in <=15 minutes).\\n(ID {rec.get('id')})\"
+            text = f"🔔 Reminder: {rec.get('first_name') or rec.get('username')}'s \"{rec.get('details')}\" starts at {rec.get('start_time')} (in <=15 minutes).\\n(ID {rec.get('id')})"
             try:
                 await application.bot.send_message(chat_id=int(team_chat), text=text)
             except Exception:
-                logger.exception(\"Failed to send reminder to team chat %s\", team_chat)
+                logger.exception("Failed to send reminder to team chat %s", team_chat)
             update_reminder_sent(rec.get('id'))
+
+# ----- Minimal webserver for keepalive -----
+async def start_webserver():
+    async def handle_root(request):
+        return web.Response(text="NextGen Manager is alive.")
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    port = int(os.environ.get("PORT", "8080"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Webserver started on port {port}")
 
 # ----- Startup -----
 async def main():
     init_sheets()
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    application.add_handler(CommandHandler(\"start\", start))
-    application.add_handler(CommandHandler(\"setteam\", setteam))
-    application.add_handler(CommandHandler(\"addslot\", addslot))
-    application.add_handler(CommandHandler(\"me\", me_cmd))
-    application.add_handler(CommandHandler(\"team\", team_cmd))
-    application.add_handler(CommandHandler(\"cancel\", cancel_cmd))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("setteam", setteam))
+    application.add_handler(CommandHandler("addslot", addslot))
+    application.add_handler(CommandHandler("me", me_cmd))
+    application.add_handler(CommandHandler("team", team_cmd))
+    application.add_handler(CommandHandler("cancel", cancel_cmd))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(check_reminders, \"interval\", seconds=60, args=[application])
+    scheduler.add_job(check_reminders, "interval", seconds=60, args=[application])
     scheduler.start()
 
-    logger.info(\"NextGen Manager bot started...\")
+    # start webserver in background (so UptimeRobot can ping)
+    import asyncio
+    asyncio.create_task(start_webserver())
+
+    logger.info("NextGen Manager bot starting polling...")
     await application.run_polling()
 
-if __name__ == \"__main__\":
+if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
